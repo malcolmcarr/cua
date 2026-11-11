@@ -14,7 +14,8 @@ use cua_driver_core::background_input::{
 
 use super::bindings::{
     ax_get_window_id, copy_ax_windows_including, copy_bool_attr, copy_element_attr,
-    copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
+    copy_string_attr, focused_element_of_pid, focused_window_id_of_pid,
+    AXUIElementCreateApplication, AXUIElementRef,
 };
 use super::snapshot::RetainedElement;
 use crate::windows::{all_windows, resolve_window_owner, WindowOwner};
@@ -150,12 +151,13 @@ pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUI
     }
 }
 
-/// One fresh `AXWindows` row: the mapped CGWindowID plus its minimized state.
-/// `minimized: None` means the attribute could not be read — unknown, not
-/// "not minimized".
+/// One fresh `AXWindows` row: the mapped CGWindowID plus its minimized and
+/// focused state. `None` means the attribute could not be read — unknown, not
+/// false.
 struct AxWindowRecord {
     window_id: u32,
     minimized: Option<bool>,
+    focused: Option<bool>,
 }
 
 /// Map the application's fresh `AXWindows` — plus the requested window when it
@@ -175,6 +177,7 @@ unsafe fn ax_window_records(app: AXUIElementRef, pid: i32, window_id: u32) -> Ve
                 .map(|window_id| AxWindowRecord {
                     window_id,
                     minimized: copy_bool_attr(window, "AXMinimized"),
+                    focused: copy_bool_attr(window, "AXFocused"),
                 });
             CFRelease(window as CFTypeRef);
             record
@@ -189,20 +192,29 @@ unsafe fn ax_window_records(app: AXUIElementRef, pid: i32, window_id: u32) -> Ve
 /// not enough to prove another process-scoped keyboard destination. Requiring a
 /// fresh `AXWindows` mapping preserves the fail-closed two-window guard while
 /// ignoring render surfaces that cannot independently become the AX key window.
+///
+/// While `focused_window_id`, the application's `AXFocusedWindow`, is the
+/// target, a sibling whose `AXFocused` reads false is not counted either:
+/// process-scoped key events go to the key window. Safari opens such a sibling,
+/// a small `AXDialog` titled "Window", while its address field is being edited.
 fn count_competing_keyboard_destinations(
     pid: i32,
     target_window_id: u32,
     window_server_rows: impl IntoIterator<Item = (i32, u32)>,
     ax_records: &[AxWindowRecord],
+    focused_window_id: Option<u32>,
 ) -> usize {
+    let target_focused = focused_window_id == Some(target_window_id);
     window_server_rows
         .into_iter()
         .filter(|(owner_pid, window_id)| {
             *owner_pid == pid
                 && *window_id != target_window_id
-                && ax_records
-                    .iter()
-                    .any(|record| record.window_id == *window_id && record.minimized != Some(true))
+                && ax_records.iter().any(|record| {
+                    record.window_id == *window_id
+                        && record.minimized != Some(true)
+                        && !(target_focused && record.focused == Some(false))
+                })
         })
         .count()
 }
@@ -261,6 +273,7 @@ pub fn gather_background_facts(
             .iter()
             .map(|window| (window.pid, window.window_id)),
         &records,
+        focused_window_id_of_pid(pid),
     );
 
     BackgroundTargetFacts {
@@ -340,6 +353,7 @@ mod tests {
         AxWindowRecord {
             window_id,
             minimized,
+            focused: Some(false),
         }
     }
 
@@ -349,7 +363,7 @@ mod tests {
         let records = [ax_window(10, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records),
+            count_competing_keyboard_destinations(42, 10, rows, &records, None),
             0
         );
     }
@@ -360,7 +374,29 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records),
+            count_competing_keyboard_destinations(42, 10, rows, &records, None),
+            1
+        );
+    }
+
+    #[test]
+    fn unfocused_sibling_is_not_a_keyboard_destination_while_the_target_is_focused() {
+        let rows = [(42, 10), (42, 11)];
+        let mut unknown = ax_window(11, Some(false));
+        unknown.focused = None;
+
+        let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
+        assert_eq!(
+            count_competing_keyboard_destinations(42, 10, rows, &records, Some(10)),
+            0
+        );
+        assert_eq!(
+            count_competing_keyboard_destinations(42, 10, rows, &records, Some(11)),
+            1
+        );
+        let records = [ax_window(10, Some(false)), unknown];
+        assert_eq!(
+            count_competing_keyboard_destinations(42, 10, rows, &records, Some(10)),
             1
         );
     }
@@ -371,7 +407,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(true))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records),
+            count_competing_keyboard_destinations(42, 10, rows, &records, None),
             0
         );
     }
@@ -382,7 +418,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records),
+            count_competing_keyboard_destinations(42, 10, rows, &records, None),
             0
         );
     }
