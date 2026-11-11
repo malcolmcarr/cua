@@ -161,15 +161,21 @@ struct AxWindowRecord {
 /// Map the application's fresh `AXWindows` — plus the requested window when it
 /// is on another Space — through `_AXUIElementGetWindow`. Windows whose id the
 /// SPI cannot resolve are omitted: an unmappable window can never satisfy an
-/// exact-target requirement.
+/// exact-target requirement. Elements whose role is not `AXWindow` are omitted
+/// too: Safari lists the images and text area of an open popover in
+/// `AXWindows`, and they map to the window they sit in or to the popover's own
+/// window, neither of which they are.
 unsafe fn ax_window_records(app: AXUIElementRef, pid: i32, window_id: u32) -> Vec<AxWindowRecord> {
     copy_ax_windows_including(app, pid, window_id)
         .into_iter()
         .filter_map(|window| {
-            let record = ax_get_window_id(window).map(|window_id| AxWindowRecord {
-                window_id,
-                minimized: copy_bool_attr(window, "AXMinimized"),
-            });
+            let is_window = copy_string_attr(window, "AXRole").as_deref() == Some("AXWindow");
+            let record = ax_get_window_id(window)
+                .filter(|_| is_window)
+                .map(|window_id| AxWindowRecord {
+                    window_id,
+                    minimized: copy_bool_attr(window, "AXMinimized"),
+                });
             CFRelease(window as CFTypeRef);
             record
         })
