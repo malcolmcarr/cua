@@ -859,7 +859,10 @@ struct TypeTextOutcome {
 enum TypedProgress {
     Complete,
     Partial(usize),
+    /// The value is exactly what it was before.
     Unchanged,
+    /// The value changed, but what changed does not begin with the text.
+    Changed,
     Unverifiable,
 }
 
@@ -879,13 +882,12 @@ fn foreground_settle_ms(pid: i32, frontmost_pid: Option<i32>) -> u64 {
 ///   must confirm via screenshot).
 /// - `after` contains the complete text → `Complete`.
 /// - empty input text → trivially `Complete`.
+/// - `after` equal to `before` → `Unchanged`.
 ///
-/// Otherwise classify an observable insertion without mistaking a prefix for
-/// complete delivery. A positive length delta is an exact delivered-character
-/// count for insert-at-cursor typing; it is capped at the request size
-/// defensively. Apps that normalize input (smart quotes, autocomplete) may fail
-/// the substring/length test even though something landed — we report it as
-/// unverified rather than erroring, so the agent can still confirm.
+/// Otherwise the inserted span is `after` without the prefix and suffix it
+/// shares with `before`, which covers typing at the cursor and typing over a
+/// selection of any length. The delivered count is how many leading characters
+/// of the text that span starts with: `Partial` when some, `Changed` when none.
 fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> TypedProgress {
     if text.is_empty() {
         return TypedProgress::Complete;
@@ -899,13 +901,30 @@ fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> Type
     let Some(before) = before else {
         return TypedProgress::Unverifiable;
     };
-    let delivered = after
-        .chars()
-        .count()
-        .saturating_sub(before.chars().count())
-        .min(text.chars().count());
+    if after == before {
+        return TypedProgress::Unchanged;
+    }
+    let before: Vec<char> = before.chars().collect();
+    let after: Vec<char> = after.chars().collect();
+    let prefix = before
+        .iter()
+        .zip(&after)
+        .take_while(|(b, a)| b == a)
+        .count();
+    let suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(b, a)| b == a)
+        .count();
+    let inserted = &after[prefix..after.len() - suffix];
+    let delivered = inserted
+        .iter()
+        .zip(text.chars())
+        .take_while(|(a, t)| **a == *t)
+        .count();
     if delivered == 0 {
-        TypedProgress::Unchanged
+        TypedProgress::Changed
     } else {
         TypedProgress::Partial(delivered)
     }
@@ -1132,6 +1151,9 @@ fn await_typed_delivery(
                 // delivery, not an unverifiable success.
                 best_partial.get_or_insert(0);
             }
+            // A value that changed without showing the text, as an address
+            // field does once a typed Return loads a page, gives no count.
+            TypedProgress::Changed => best_partial = None,
         }
         if std::time::Instant::now() >= deadline {
             return (false, best_partial);
@@ -1334,6 +1356,20 @@ fn type_text_blocking(
             }
         },
     };
+    // An AXSelectedText write into a single-line field does not press Return
+    // for a line break; keystrokes do.
+    let ax_target = ax_target.and_then(|(element, owns, idx)| {
+        let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+        if text.contains(['\n', '\r']) && matches!(role.as_str(), "AXTextField" | "AXComboBox") {
+            tracing::debug!("type_text: line break into {role}; using CGEvent keystrokes");
+            if owns {
+                unsafe { CFRelease(element as _) };
+            }
+            None
+        } else {
+            Some((element, owns, idx))
+        }
+    });
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -1378,12 +1414,25 @@ fn type_text_blocking(
                 delivered_chars: Some(delivered_chars),
             }));
         }
+        // The write changed the field without showing the text. Typing it
+        // again could deliver it twice, so the result stays unverified.
+        if ax_progress == Some(TypedProgress::Changed) {
+            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
+            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                detail: format!(" via AX write into{idx_str} {role} \"{title}\""),
+                path: PATH_AX,
+                verified: false,
+                delivered_chars: None,
+            }));
+        }
         ax_attempt = match ax_progress {
             Some(TypedProgress::Unchanged) if unchanged_web_readback => AxAttempt::Unverifiable,
             Some(TypedProgress::Unchanged) => AxAttempt::Unchanged,
             Some(TypedProgress::Unverifiable) => AxAttempt::Unverifiable,
             None => AxAttempt::Rejected,
-            Some(TypedProgress::Complete | TypedProgress::Partial(_)) => unreachable!(),
+            Some(TypedProgress::Complete | TypedProgress::Partial(_) | TypedProgress::Changed) => {
+                unreachable!()
+            }
         };
         tracing::debug!(
             "AX write did not land for {role} \"{title}\" (err={err}); \
@@ -1555,6 +1604,25 @@ mod tests {
             ),
             (Some("ab"), Some("ab"), "hi", Unchanged),
             (None, None, "", Complete),
+            // Typing over a longer selection.
+            (
+                Some("https://example.com/long"),
+                Some("exa"),
+                "example.net",
+                Partial(3),
+            ),
+            (
+                Some("https://example.com/long"),
+                Some("example.net"),
+                "example.net",
+                Complete,
+            ),
+            (
+                Some("https://example.com/"),
+                Some("https://example.org/"),
+                "x\n",
+                Changed,
+            ),
         ] {
             assert_eq!(
                 typed_progress(before, after, text),
@@ -1594,6 +1662,25 @@ mod tests {
             || Some("BEGIN".to_owned()),
         );
         assert_eq!(delivery, (false, Some(5)));
+    }
+
+    #[test]
+    fn a_value_that_stops_showing_the_text_gives_no_count() {
+        let mut values = std::collections::VecDeque::from([
+            Some("example.ne".to_owned()),
+            Some("https://example.net/".to_owned()),
+        ]);
+        let delivery = await_typed_delivery(
+            Some("https://example.com/long"),
+            "example.net\n",
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+            || {
+                values
+                    .pop_front()
+                    .unwrap_or(Some("https://example.net/".to_owned()))
+            },
+        );
+        assert_eq!(delivery, (false, None));
     }
 
     #[test]
